@@ -22,10 +22,14 @@
 #include <QQuickRenderControl>
 #include <QQuickGraphicsDevice>
 
-// --- NOVO: NECESSÁRIO PARA A MIRA FUNCIONAR ---
+// --- ADICIONADO PARA CORRIGIR O ERRO ---
 #include <QMouseEvent>
 #include <QCursor>
-// ----------------------------------------------
+// ---------------------------------------
+
+#if defined(Q_OS_MACOS)
+#include <objc/message.h>
+#endif
 
 #if defined(Q_OS_MACOS)
 #include <objc/message.h>
