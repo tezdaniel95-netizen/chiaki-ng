@@ -287,6 +287,11 @@ class StreamSession : public QObject
 		void ConnectRumbleHaptics();
 
 	public:
+        // --- CUSTOM ADDITIONS FOR MOUSE AIM ---
+        ChiakiControllerState& GetAimState() { return keyboard_state; }
+        void ForceSendInput() { SendFeedbackState(); }
+        // --------------------------------------
+
 		explicit StreamSession(const StreamSessionConnectInfo &connect_info, QObject *parent = nullptr);
 		~StreamSession();
 
