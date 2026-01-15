@@ -84,7 +84,6 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
 {
 	// old frame?
 	ChiakiSeqNum16 frame_index = packet->frame_index;
-	ChiakiErrorCode err = CHIAKI_ERR_SUCCESS;
 	if(video_receiver->frame_index_cur >= 0
 		&& chiaki_seq_num_16_lt(frame_index, (ChiakiSeqNum16)video_receiver->frame_index_cur))
 	{
@@ -97,7 +96,7 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
 	{
 		if(packet->adaptive_stream_index >= video_receiver->profiles_count)
 		{
-			CHIAKI_LOGE(video_receiver->log, "Packet has invalid adaptive stream index %u >= %u",
+			CHIAKI_LOGE(video_receiver->log, "Packet has invalid adaptive stream index %lu >= %lu",
 					(unsigned int)packet->adaptive_stream_index,
 					(unsigned int)video_receiver->profiles_count);
 			return;
@@ -109,7 +108,7 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
 		if(video_receiver->session->video_sample_cb)
 			video_receiver->session->video_sample_cb(profile->header, profile->header_sz, 0, false, video_receiver->session->video_sample_cb_user);
 		if(!chiaki_bitstream_header(&video_receiver->bitstream, profile->header, profile->header_sz))
-			CHIAKI_LOGW(video_receiver->log, "Failed to parse video header");
+			CHIAKI_LOGE(video_receiver->log, "Failed to parse video header");
 	}
 
 	// next frame?
@@ -121,39 +120,28 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
 
 		// last frame not flushed yet?
 		if(video_receiver->frame_index_cur >= 0 && video_receiver->frame_index_prev != video_receiver->frame_index_cur)
-			err = chiaki_video_receiver_flush_frame(video_receiver);
-
-		if(err != CHIAKI_ERR_SUCCESS)
-			CHIAKI_LOGW(video_receiver->log, "Video receiver could not flush frame.");
+			chiaki_video_receiver_flush_frame(video_receiver);
 
 		ChiakiSeqNum16 next_frame_expected = (ChiakiSeqNum16)(video_receiver->frame_index_prev_complete + 1);
 		if(chiaki_seq_num_16_gt(frame_index, next_frame_expected)
 			&& !(frame_index == 1 && video_receiver->frame_index_cur < 0)) // ok for frame 1
 		{
 			CHIAKI_LOGW(video_receiver->log, "Detected missing or corrupt frame(s) from %d to %d", next_frame_expected, (int)frame_index);
-			err = stream_connection_send_corrupt_frame(&video_receiver->session->stream_connection, next_frame_expected, frame_index - 1);
-			if(err != CHIAKI_ERR_SUCCESS)
-				CHIAKI_LOGW(video_receiver->log, "Error sending corrupt frame.");
+			stream_connection_send_corrupt_frame(&video_receiver->session->stream_connection, next_frame_expected, frame_index - 1);
 		}
 
 		video_receiver->frame_index_cur = frame_index;
-		err = chiaki_frame_processor_alloc_frame(&video_receiver->frame_processor, packet);
-		if(err != CHIAKI_ERR_SUCCESS)
-			CHIAKI_LOGW(video_receiver->log, "Video receiver could not allocate frame for packet.");
+		chiaki_frame_processor_alloc_frame(&video_receiver->frame_processor, packet);
 	}
 
-	err = chiaki_frame_processor_put_unit(&video_receiver->frame_processor, packet);
-	if(err != CHIAKI_ERR_SUCCESS)
-		CHIAKI_LOGW(video_receiver->log, "Video receiver could not put unit.");
+	chiaki_frame_processor_put_unit(&video_receiver->frame_processor, packet);
 
 	// if we are currently building up a frame
 	if(video_receiver->frame_index_cur != video_receiver->frame_index_prev)
 	{
 		// if we already have enough for the whole frame, flush it already
 		if(chiaki_frame_processor_flush_possible(&video_receiver->frame_processor) || packet->unit_index == packet->units_in_frame_total - 1)
-			err = chiaki_video_receiver_flush_frame(video_receiver);
-		if(err != CHIAKI_ERR_SUCCESS)
-			CHIAKI_LOGW(video_receiver->log, "Video receiver could not flush frame.");
+			chiaki_video_receiver_flush_frame(video_receiver);
 	}
 }
 
@@ -213,7 +201,13 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
 
 	if(succ && video_receiver->session->video_sample_cb)
 	{
-		bool cb_succ = video_receiver->session->video_sample_cb(frame, frame_size, video_receiver->frames_lost, recovered, video_receiver->session->video_sample_cb_user);
+		// --- MODIFICAÇÃO: BYPASS DE VÍDEO ---
+		// Comentamos a chamada real que processaria o vídeo (pesado)
+		// bool cb_succ = video_receiver->session->video_sample_cb(frame, frame_size, video_receiver->frames_lost, recovered, video_receiver->session->video_sample_cb_user);
+		
+		// Fingimos que deu tudo certo para manter a conexão
+		bool cb_succ = true;
+		
 		video_receiver->frames_lost = 0;
 		if(!cb_succ)
 		{
