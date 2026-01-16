@@ -15,6 +15,15 @@
 #include <QtMath>
 
 #include <cstring>
+#include <atomic> // [CRONUS MOD] Necessário para as variáveis globais
+
+// =================================================================
+// [CRONUS MOD - PARTE 1]
+// Variáveis Globais para controle do Recoil
+// =================================================================
+std::atomic<bool> g_recoilEnabled(false);
+std::atomic<int> g_recoilStrength(0);
+// =================================================================
 
 #define SETSU_UPDATE_INTERVAL_MS 4
 #define STEAMDECK_UPDATE_INTERVAL_MS 4
@@ -101,11 +110,426 @@ StreamSessionConnectInfo::StreamSessionConnectInfo(
 	this->nickname = std::move(nickname);
 	this->host = std::move(host);
 	this->regist_key = std::move(regist_key);
+	this->morning = std::move(morning);
+	this->initial_login_pin = std::move(initial_login_pin);
+	audio_buffer_size = settings->GetAudioBufferSize();
+	this->fullscreen = fullscreen;
+	this->zoom = zoom;
+	this->stretch = stretch;
+	this->keyboard_controller_enabled = settings->GetKeyboardEnabled();
+	this->mouse_touch_enabled = settings->GetMouseTouchEnabled();
+	this->enable_keyboard = false; // TODO: from settings
+	this->enable_dualsense = true;
+	this->rumble_haptics_intensity = settings->GetRumbleHapticsIntensity();
+	this->buttons_by_pos = settings->GetButtonsByPosition();
+	this->start_mic_unmuted = settings->GetStartMicUnmuted();
+	this->packet_loss_max = settings->GetPacketLossMax();
+	this->audio_video_disabled = settings->GetAudioVideoDisabled();
+	this->haptic_override = settings->GetHapticOverride();
+#if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
+	this->enable_steamdeck_haptics = settings->GetSteamDeckHapticsEnabled();
+	this->vertical_sdeck = settings->GetVerticalDeckEnabled();
+#endif
+#if CHIAKI_GUI_ENABLE_SPEEX
+	this->speech_processing_enabled = settings->GetSpeechProcessingEnabled();
+	this->noise_suppress_level = settings->GetNoiseSuppressLevel();
+	this->echo_suppress_level = settings->GetEchoSuppressLevel();
+#endif
+	this->psn_token = settings->GetPsnAuthToken();
+	this->psn_account_id = settings->GetPsnAccountId();
+	this->duid = std::move(duid);
+	this->auto_regist = auto_regist;
+	this->dpad_touch_increment = settings->GetDpadTouchEnabled() ? settings->GetDpadTouchIncrement(): 0;
+	this->dpad_touch_shortcut1 = settings->GetDpadTouchShortcut1();
+	if(this->dpad_touch_shortcut1 > 0)
+		this->dpad_touch_shortcut1 = 1 << (this->dpad_touch_shortcut1 - 1);
+	this->dpad_touch_shortcut2 = settings->GetDpadTouchShortcut2();
+	if(this->dpad_touch_shortcut2 > 0)
+		this->dpad_touch_shortcut2 = 1 << (this->dpad_touch_shortcut2 - 1);
+	this->dpad_touch_shortcut3 = settings->GetDpadTouchShortcut3();
+	if(this->dpad_touch_shortcut3 > 0)
+		this->dpad_touch_shortcut3 = 1 << (this->dpad_touch_shortcut3 - 1);
+	this->dpad_touch_shortcut4 = settings->GetDpadTouchShortcut4();
+	if(this->dpad_touch_shortcut4 > 0)
+		this->dpad_touch_shortcut4 = 1 << (this->dpad_touch_shortcut4 - 1);
+}
+
+static void AudioSettingsCb(uint32_t channels, uint32_t rate, void *user);
+static void AudioFrameCb(int16_t *buf, size_t samples_count, void *user);
+static void HapticsFrameCb(uint8_t *buf, size_t buf_size, void *user);
+#ifdef Q_OS_MACOS
+static void MacMicRequestCb(Authorization authorization, void *user);
+#endif
+static void CantDisplayCb(void *user, bool cant_display);
+static void EventCb(ChiakiEvent *event, void *user);
+#if CHIAKI_GUI_ENABLE_SETSU
+static void SessionSetsuCb(SetsuEvent *event, void *user);
+#endif
+#if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
+static void SessionSDeckCb(SDeckEvent *event, void *user);
+#endif
+static void FfmpegFrameCb(ChiakiFfmpegDecoder *decoder, void *user);
+
+StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObject *parent)
+	: QObject(parent),
+	log(this, connect_info.log_level_mask, connect_info.log_file),
+	ffmpeg_decoder(nullptr),
+#if CHIAKI_LIB_ENABLE_PI_DECODER
+	pi_decoder(nullptr),
+#endif
+	audio_out(0),
+	audio_in(0),
+	haptics_output(0),
+	haptics_handheld(0),
+	session_started(false),
+#if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
+	sdeck_haptics_senderl(nullptr),
+	sdeck_haptics_senderr(nullptr),
+	sdeck(nullptr),
+#endif
+#if CHIAKI_GUI_ENABLE_SPEEX
+	echo_resampler_buf(nullptr),
+	mic_resampler_buf(nullptr),
+#endif
+	haptics_resampler_buf(nullptr),
+	holepunch_session(nullptr),
+	rumble_multiplier(1),
+	ps5_rumble_intensity(0x00),
+	ps5_trigger_intensity(0x00),
+	rumble_haptics_connected(false),
+	rumble_haptics_on(false)
+{
+	mic_buf.buf = nullptr;
+	connected = false;
+	muted = true;
+	mic_connected = false;
+#ifdef Q_OS_MACOS
+	mic_authorization = false;
+#endif
+	allow_unmute = false;
+	dpad_regular = true;
+	dpad_regular_touch_switched = false;
+	rumble_haptics_intensity = RumbleHapticsIntensity::Off;
+	input_block = 0;
+	player_index = 0;
+	memset(led_color, 0, sizeof(led_color));
+	ChiakiErrorCode err;
+#if CHIAKI_LIB_ENABLE_PI_DECODER
+	if(connect_info.decoder == Decoder::Pi)
+	{
+		pi_decoder = CHIAKI_NEW(ChiakiPiDecoder);
+		if(chiaki_pi_decoder_init(pi_decoder, log.GetChiakiLog()) != CHIAKI_ERR_SUCCESS)
+			throw ChiakiException("Failed to initialize Raspberry Pi Decoder");
+	}
+	else
+	{
+#endif
+		ffmpeg_decoder = new ChiakiFfmpegDecoder;
+		ChiakiLogSniffer sniffer;
+		chiaki_log_sniffer_init(&sniffer, CHIAKI_LOG_ALL, GetChiakiLog());
+		err = chiaki_ffmpeg_decoder_init(ffmpeg_decoder,
+				chiaki_log_sniffer_get_log(&sniffer),
+				chiaki_target_is_ps5(connect_info.target) ? connect_info.video_profile.codec : CHIAKI_CODEC_H264,
+				connect_info.hw_decoder.isEmpty() ? NULL : connect_info.hw_decoder.toUtf8().constData(),
+				connect_info.hw_device_ctx, FfmpegFrameCb, this);
+		if(err != CHIAKI_ERR_SUCCESS)
+		{
+			QString log = QString::fromUtf8(chiaki_log_sniffer_get_buffer(&sniffer));
+			chiaki_log_sniffer_fini(&sniffer);
+			throw ChiakiException("Failed to initialize FFMPEG Decoder:\n" + log);
+		}
+		chiaki_log_sniffer_fini(&sniffer);
+		ffmpeg_decoder->log = GetChiakiLog();
+#if CHIAKI_LIB_ENABLE_PI_DECODER
+	}
+#endif
+	audio_volume = connect_info.audio_volume;
+	start_mic_unmuted = connect_info.start_mic_unmuted;
+	audio_out_device_name = connect_info.audio_out_device;
+	audio_in_device_name = connect_info.audio_in_device;
+
+	chiaki_opus_decoder_init(&opus_decoder, log.GetChiakiLog());
+	chiaki_opus_encoder_init(&opus_encoder, log.GetChiakiLog());
+#if CHIAKI_GUI_ENABLE_SPEEX
+	speech_processing_enabled = connect_info.speech_processing_enabled;
+	if(speech_processing_enabled)
+	{
+		echo_state = speex_echo_state_init(MICROPHONE_SAMPLES, MICROPHONE_SAMPLES * 10);
+		preprocess_state = speex_preprocess_state_init(MICROPHONE_SAMPLES, MICROPHONE_SAMPLES * 100);
+		int32_t noise_suppress_level = -1 * connect_info.noise_suppress_level;
+		int32_t echo_suppress_level = -1 * connect_info.echo_suppress_level;
+		speex_preprocess_ctl(preprocess_state, SPEEX_PREPROCESS_SET_ECHO_STATE, echo_state);
+		speex_preprocess_ctl(preprocess_state, SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, &noise_suppress_level);
+		speex_preprocess_ctl(preprocess_state, SPEEX_PREPROCESS_GET_NOISE_SUPPRESS, &noise_suppress_level);
+		CHIAKI_LOGI(GetChiakiLog(), "Noise suppress level is %i dB", noise_suppress_level);
+		speex_preprocess_ctl(preprocess_state, SPEEX_PREPROCESS_SET_ECHO_SUPPRESS, &echo_suppress_level);
+		speex_preprocess_ctl(preprocess_state, SPEEX_PREPROCESS_GET_ECHO_SUPPRESS, &echo_suppress_level);
+		CHIAKI_LOGI(GetChiakiLog(), "Echo suppress level is %i dB", echo_suppress_level);
+		CHIAKI_LOGI(GetChiakiLog(), "Started microphone echo cancellation and noise suppression");
+	}
+#endif
+	audio_buffer_size = connect_info.audio_buffer_size;
+	mouse_touch_enabled = connect_info.mouse_touch_enabled;
+	keyboard_controller_enabled = connect_info.keyboard_controller_enabled;
+	host = connect_info.host;
+	QByteArray host_str = connect_info.host.toUtf8();
+
+	ChiakiConnectInfo chiaki_connect_info = {};
+	chiaki_connect_info.ps5 = chiaki_target_is_ps5(connect_info.target);
+	chiaki_connect_info.host = host_str.constData();
+	chiaki_connect_info.video_profile = connect_info.video_profile;
+	chiaki_connect_info.video_profile_auto_downgrade = true;
+	chiaki_connect_info.enable_keyboard = false;
+	chiaki_connect_info.enable_dualsense = connect_info.enable_dualsense;
+	chiaki_connect_info.packet_loss_max = connect_info.packet_loss_max;
+	chiaki_connect_info.auto_regist = connect_info.auto_regist;
+	chiaki_connect_info.audio_video_disabled = connect_info.audio_video_disabled;
+
+	dpad_touch_shortcut1 = connect_info.dpad_touch_shortcut1;
+	dpad_touch_shortcut2 = connect_info.dpad_touch_shortcut2;
+	dpad_touch_shortcut3 = connect_info.dpad_touch_shortcut3;
+	dpad_touch_shortcut4 = connect_info.dpad_touch_shortcut4;
+	haptic_override = connect_info.haptic_override;
+#if CHIAKI_LIB_ENABLE_PI_DECODER
+	if(connect_info.decoder == Decoder::Pi && chiaki_connect_info.video_profile.codec != CHIAKI_CODEC_H264)
+	{
+		CHIAKI_LOGW(GetChiakiLog(), "A codec other than H264 was requested for Pi Decoder. Falling back to it.");
+		chiaki_connect_info.video_profile.codec = CHIAKI_CODEC_H264;
+	}
+#endif
+	if(connect_info.duid.isEmpty())
+	{
+		if(connect_info.regist_key.size() != sizeof(chiaki_connect_info.regist_key))
+			throw ChiakiException("RegistKey invalid");
+		memcpy(chiaki_connect_info.regist_key, connect_info.regist_key.constData(), sizeof(chiaki_connect_info.regist_key));
+
+		if(connect_info.morning.size() != sizeof(chiaki_connect_info.morning))
+			throw ChiakiException("Morning invalid");
+		memcpy(chiaki_connect_info.morning, connect_info.morning.constData(), sizeof(chiaki_connect_info.morning));
+	}
+
+	if(chiaki_connect_info.ps5)
+	{
+		PS_TOUCHPAD_MAX_X = PS5_TOUCHPAD_MAX_X;
+		PS_TOUCHPAD_MAX_Y = PS5_TOUCHPAD_MAX_Y;
+	}
+	else
+	{
+		PS_TOUCHPAD_MAX_X = PS4_TOUCHPAD_MAX_X;
 		PS_TOUCHPAD_MAX_Y = PS4_TOUCHPAD_MAX_Y;
 	}
 
 	chiaki_controller_state_set_idle(&keyboard_state);
 	chiaki_controller_state_set_idle(&touch_state);
+	touch_tracker=QMap<int, uint8_t>();
+	mouse_touch_id=-1;
+	dpad_touch_id =-1;
+	chiaki_controller_state_set_idle(&dpad_touch_state);
+	dpad_touch_value = QPair<uint16_t, uint16_t>(0,0);
+	dpad_touch_increment = connect_info.dpad_touch_increment;
+	dpad_touch_timer = new QTimer(this);
+	connect(dpad_touch_timer, &QTimer::timeout, this, &StreamSession::DpadSendFeedbackState);
+	dpad_touch_timer->setInterval(DPAD_TOUCH_UPDATE_INTERVAL_MS);
+	dpad_touch_stop_timer = new QTimer(this);
+	dpad_touch_stop_timer->setSingleShot(true);
+	connect(dpad_touch_stop_timer, &QTimer::timeout, this, [this]{
+		if(dpad_touch_id >= 0)
+		{
+			dpad_touch_timer->stop();
+			chiaki_controller_state_stop_touch(&dpad_touch_state, (uint8_t)dpad_touch_id);
+			dpad_touch_id = -1;
+			SendFeedbackState();
+		}
+	});
+	// If duid isn't empty connect with psn
+	chiaki_connect_info.holepunch_session = NULL;
+	if(!connect_info.duid.isEmpty())
+	{
+		err = InitiatePsnConnection(connect_info.psn_token);
+		if (err != CHIAKI_ERR_SUCCESS)
+			throw ChiakiException("Psn Connection Failed " + QString::fromLocal8Bit(chiaki_error_string(err)));
+		chiaki_connect_info.holepunch_session = holepunch_session;
+        QByteArray psn_account_id = QByteArray::fromBase64(connect_info.psn_account_id.toUtf8());
+        if (psn_account_id.size() != CHIAKI_PSN_ACCOUNT_ID_SIZE) {
+            throw ChiakiException((tr("Invalid Account-ID"), tr("The PSN Account-ID must be exactly %1 bytes encoded as base64.")).arg(CHIAKI_PSN_ACCOUNT_ID_SIZE));
+        }
+        memcpy(chiaki_connect_info.psn_account_id, psn_account_id.constData(), CHIAKI_PSN_ACCOUNT_ID_SIZE);
+	}
+	err = chiaki_session_init(&session, &chiaki_connect_info, GetChiakiLog());
+	if(err != CHIAKI_ERR_SUCCESS)
+		throw ChiakiException("Chiaki Session Init failed: " + QString::fromLocal8Bit(chiaki_error_string(err)));
+	ChiakiCtrlDisplaySink display_sink;
+	display_sink.user = this;
+	display_sink.cantdisplay_cb = CantDisplayCb;
+	chiaki_session_ctrl_set_display_sink(&session, &display_sink);
+	chiaki_opus_decoder_set_cb(&opus_decoder, AudioSettingsCb, AudioFrameCb, this);
+	ChiakiAudioSink audio_sink;
+	chiaki_opus_decoder_get_sink(&opus_decoder, &audio_sink);
+	chiaki_session_set_audio_sink(&session, &audio_sink);
+	ChiakiAudioHeader audio_header;
+	chiaki_audio_header_set(&audio_header, 2, 16, MICROPHONE_SAMPLES * 100, MICROPHONE_SAMPLES);
+	chiaki_opus_encoder_header(&audio_header, &opus_encoder, &session);
+
+	if (connect_info.enable_dualsense)
+	{
+		ChiakiAudioSink haptics_sink;
+		haptics_sink.user = this;
+		haptics_sink.frame_cb = HapticsFrameCb;
+		chiaki_session_set_haptics_sink(&session, &haptics_sink);
+	}
+#if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
+	if (connect_info.enable_steamdeck_haptics)
+		enable_steamdeck_haptics = true;
+	else
+		enable_steamdeck_haptics = false;
+#endif
+#if CHIAKI_LIB_ENABLE_PI_DECODER
+	if(pi_decoder)
+		chiaki_session_set_video_sample_cb(&session, chiaki_pi_decoder_video_sample_cb, pi_decoder);
+	else
+	{
+#endif
+		chiaki_session_set_video_sample_cb(&session, chiaki_ffmpeg_decoder_video_sample_cb, ffmpeg_decoder);
+#if CHIAKI_LIB_ENABLE_PI_DECODER
+	}
+#endif
+
+	chiaki_session_set_event_cb(&session, EventCb, this);
+
+#if CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
+	connect(ControllerManager::GetInstance(), &ControllerManager::AvailableControllersUpdated, this, &StreamSession::UpdateGamepads);
+	connect(this, &StreamSession::DualSenseIntensityChanged, ControllerManager::GetInstance(), &ControllerManager::SetDualSenseIntensity);
+	if(connect_info.buttons_by_pos)
+		ControllerManager::GetInstance()->SetButtonsByPos();
+#endif
+#if CHIAKI_GUI_ENABLE_SETSU
+	setsu_motion_device = nullptr;
+	chiaki_controller_state_set_idle(&setsu_state);
+	chiaki_accel_new_zero_set_inactive(&setsu_accel_zero, false);
+	chiaki_accel_new_zero_set_inactive(&setsu_real_accel, true);
+	setsu_ids=QMap<QPair<QString, SetsuTrackingId>, uint8_t>();
+	orient_dirty = true;
+	chiaki_orientation_tracker_init(&orient_tracker);
+	setsu = setsu_new();
+	auto timer = new QTimer(this);
+	connect(timer, &QTimer::timeout, this, [this]{
+		setsu_poll(setsu, SessionSetsuCb, this);
+		if(orient_dirty)
+		{
+			chiaki_orientation_tracker_apply_to_controller_state(&orient_tracker, &setsu_state);
+			SendFeedbackState();
+			orient_dirty = false;
+		}
+	});
+	timer->start(SETSU_UPDATE_INTERVAL_MS);
+#endif
+
+#if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
+	chiaki_controller_state_set_idle(&sdeck_state);
+	sdeck = sdeck_new();
+	// no concept of hotplug for Steam Deck so turn off if not detected immediately
+	if(!sdeck)
+		CHIAKI_LOGI(GetChiakiLog(), "Steam Deck not found ... Steam Deck native features disabled\n\n");
+	else
+	{
+		CHIAKI_LOGI(GetChiakiLog(), "Connected Steam Deck ... gyro online\n\n");
+		vertical_sdeck = connect_info.vertical_sdeck;
+		chiaki_accel_new_zero_set_inactive(&sdeck_accel_zero, false);
+		chiaki_accel_new_zero_set_inactive(&sdeck_real_accel, true);
+		chiaki_orientation_tracker_init(&sdeck_orient_tracker);
+		sdeck_orient_dirty = true;
+
+		auto sdeck_timer = new QTimer(this);
+		connect(sdeck_timer, &QTimer::timeout, this, [this]{
+			sdeck_read(sdeck, SessionSDeckCb, this);
+			if(sdeck_orient_dirty)
+			{
+				chiaki_orientation_tracker_apply_to_controller_state(&sdeck_orient_tracker, &sdeck_state);
+				SendFeedbackState();
+				sdeck_orient_dirty = false;
+			}
+		});
+		sdeck_timer->start(STEAMDECK_UPDATE_INTERVAL_MS);
+	}
+#endif
+	key_map = connect_info.key_map;
+	if (connect_info.enable_dualsense)
+	{
+		InitHaptics();
+#if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
+		// Connect Steam Deck haptics with a delay to give other potential haptics time to set up
+		if(sdeck)
+		{
+			haptics_handheld++;
+			QTimer::singleShot(1100, this, &StreamSession::ConnectSdeckHaptics);
+		}
+#endif
+		rumble_haptics_intensity = connect_info.rumble_haptics_intensity;
+		ConnectRumbleHaptics();
+	}
+	UpdateGamepads();
+
+	QTimer *packet_loss_timer = new QTimer(this);
+	packet_loss_timer->setInterval(200);
+	packet_loss_timer->start();
+	connect(packet_loss_timer, &QTimer::timeout, this, [this]() {
+		if(packet_loss_history.size() > 10)
+			packet_loss_history.takeFirst();
+		packet_loss_history.append(session.stream_connection.congestion_control.packet_loss);
+		double packet_loss = 0;
+		for(auto v : std::as_const(packet_loss_history))
+			packet_loss += v / packet_loss_history.size();
+		if(packet_loss != average_packet_loss)
+		{
+			average_packet_loss = packet_loss;
+			emit AveragePacketLossChanged();
+		}
+	});
+}
+
+StreamSession::~StreamSession()
+{
+	if(audio_out)
+		SDL_CloseAudioDevice(audio_out);
+	if(audio_in)
+		SDL_CloseAudioDevice(audio_in);
+	if(session_started)
+		chiaki_session_join(&session);
+	chiaki_session_fini(&session);
+	chiaki_opus_decoder_fini(&opus_decoder);
+	chiaki_opus_encoder_fini(&opus_encoder);
+#if CHIAKI_GUI_ENABLE_SPEEX
+	if(speech_processing_enabled)
+	{
+		speex_echo_state_destroy(echo_state);
+		speex_preprocess_state_destroy(preprocess_state);
+	}
+#endif
+#if CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
+	QMetaObject::invokeMethod(this, [this]() {
+		for(auto controller : controllers)
+		{
+			const uint8_t clear_effect[10] = { 0 };
+			controller->SetTriggerEffects(0x05, clear_effect, 0x05, clear_effect);
+			controller->SetRumble(0,0);
+			controller->Unref();
+		}
+	});
+#endif
+#if CHIAKI_GUI_ENABLE_SETSU
+	setsu_free(setsu);
+#endif
+#if CHIAKI_GUI_ENABLE_STEAMDECK_NATIVE
+	sdeck_free(sdeck);
+#endif
+#if CHIAKI_LIB_ENABLE_PI_DECODER
+	if(pi_decoder)
+	{
+		chiaki_pi_decoder_fini(pi_decoder);
+		free(pi_decoder);
+	}
+#endif
+	if(ffmpeg_decod	chiaki_controller_state_set_idle(&touch_state);
 	touch_tracker=QMap<int, uint8_t>();
 	mouse_touch_id=-1;
 	dpad_touch_id =-1;
